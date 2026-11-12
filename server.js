@@ -1,6 +1,7 @@
-// OperalsMeet — signalling server + mediasoup SFU
+// OperalsMeet — serveur : signalisation, serveur média SFU (mediasoup), co-working et discussion.
 require('dotenv').config();
 const os = require('os');
+const path = require('path');
 const http = require('http');
 const express = require('express');
 const { Server } = require('socket.io');
@@ -9,11 +10,10 @@ const db = require('./db');
 
 const PORT = Number(process.env.PORT || 3000);
 const MAX_PEERS = Number(process.env.MAX_PEERS || 30);
-const RTC_PORT = Number(process.env.RTC_PORT || 40000);
+const RTC_PORT = Number(process.env.RTC_PORT || 40000); // UDP+TCP; one port per worker (40000, 40001, …)
 const LISTEN_IP = process.env.LISTEN_IP || '0.0.0.0';
-const ANNOUNCED_IP = process.env.ANNOUNCED_IP || guessIp();
+const ANNOUNCED_IP = process.env.ANNOUNCED_IP || guessIp(); // public IP of the server in production
 const NUM_WORKERS = Number(process.env.MEDIASOUP_WORKERS || Math.min(os.cpus().length, 4));
-const FRONTEND_URL = process.env.FRONTEND_URL || '*';
 
 function guessIp() {
   for (const list of Object.values(os.networkInterfaces()))
@@ -48,6 +48,7 @@ async function startWorkers() {
 // ------------------------------------------------------------------ HTTP
 const app = express();
 const server = http.createServer(app);
+const FRONTEND_URL = process.env.FRONTEND_URL || '*';
 const io = new Server(server, {
   maxHttpBufferSize: 5e6,
   pingTimeout: 20000,
@@ -55,6 +56,7 @@ const io = new Server(server, {
 });
 
 app.use((req, res, next) => { res.setHeader('Access-Control-Allow-Origin', FRONTEND_URL); next(); });
+app.get('/vendor/purify.min.js', (_req, res) => res.sendFile(require.resolve('dompurify/dist/purify.min.js')));
 app.get('/config', (_req, res) => {
   let iceServers = [];
   if (process.env.ICE_SERVERS) { try { iceServers = JSON.parse(process.env.ICE_SERVERS); } catch { console.warn('ICE_SERVERS invalide'); } }
@@ -63,6 +65,7 @@ app.get('/config', (_req, res) => {
 app.get('/health', (_req, res) => res.json({ ok: true, rooms: rooms.size, peers: [...rooms.values()].reduce((n, r) => n + (r.peers?.size || 0), 0) }));
 
 // ------------------------------------------------------------------ rooms
+/** id -> room | Promise<room> */
 const rooms = new Map();
 async function getRoom(id) {
   const r = rooms.get(id);
@@ -91,6 +94,7 @@ io.on('connection', (socket) => {
   let room = null;
   let peer = null;
 
+  // async handler helper: always answer the ack, never crash
   const on = (ev, fn) => socket.on(ev, async (data, ack) => {
     try { const r = await fn(data || {}); if (typeof ack === 'function') ack(r || {}); }
     catch (e) { console.warn(ev, e.message); if (typeof ack === 'function') ack({ error: e.message }); }
@@ -171,12 +175,14 @@ io.on('connection', (socket) => {
     if (c?.type === 'simulcast') await c.setPreferredLayers({ spatialLayer: Math.max(0, Math.min(2, spatialLayer | 0)), temporalLayer: 2 });
   });
 
+  // ---- participant state ----
   on('state', (patch) => {
     need();
     for (const k of ['cam', 'mic', 'hand', 'screen']) if (k in patch) peer[k] = !!patch[k];
     socket.to(room.id).emit('peer-state', { id: socket.id, name: peer.name, cam: peer.cam, mic: peer.mic, hand: peer.hand, screen: peer.screen });
   });
 
+  // ---- co-working document ----
   on('doc-open', ({ html }) => {
     need();
     room.doc.open = true; room.doc.openedBy = peer.name;
@@ -194,11 +200,12 @@ io.on('connection', (socket) => {
     db.saveDocument(room.id, room.doc.title, room.doc.html, room.doc.version).catch(() => {});
   });
   on('doc-close', () => {
-    need(); if (socket.id !== room.organizerId) throw new Error('Réservé à l\'organisateur');
+    need(); if (socket.id !== room.organizerId) throw new Error('Réservé à l’organisateur');
     room.doc.open = false;
     io.to(room.id).emit('doc-closed', { by: peer.name });
   });
 
+  // ---- chat ----
   on('chat', ({ text }) => {
     need(); if (typeof text !== 'string' || !text.trim()) return;
     const msg = { id: socket.id, name: peer.name, text: text.slice(0, 2000), ts: Date.now() };
@@ -211,7 +218,7 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', () => {
     if (!room || !peer) return;
-    for (const t of peer.transports.values()) t.close();
+    for (const t of peer.transports.values()) t.close(); // closes its producers & consumers
     room.peers.delete(socket.id);
     socket.to(room.id).emit('peer-left', { id: socket.id });
     if (room.organizerId === socket.id) {
@@ -231,4 +238,4 @@ startWorkers().then(() => db.setup()).then(() => {
     console.log(`OperalsMeet : http://localhost:${PORT}`);
     console.log(`Média : ${NUM_WORKERS} worker(s), UDP/TCP ${RTC_PORT}-${RTC_PORT + NUM_WORKERS - 1}, IP annoncée ${ANNOUNCED_IP}, ${MAX_PEERS} participants max`);
   });
-}).catch((e) => { console.error('Démarrage impossible :', e); process.exit(1); });
+}).catch((e) => { console.error('Démarrage mediasoup impossible :', e); process.exit(1); });
